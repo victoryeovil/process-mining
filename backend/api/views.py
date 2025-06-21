@@ -14,6 +14,7 @@ from pm4py import convert
 from pm4py.objects.log.util import dataframe_utils
 from pm4py.algo.discovery.alpha import algorithm as alpha_miner
 from pm4py.visualization.petri_net import visualizer as pn_visualizer
+from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 
 
 def get_database_uri():
@@ -111,3 +112,119 @@ class PredictDurationView(APIView):
             "case_id": case_id,
             "predicted_duration_hours": float(pred),
         })
+
+
+class PerformanceView(APIView):
+    """
+    GET /api/performance/
+    Returns:
+      {
+        throughput: [{date: "YYYY-MM-DD", count: N}, ...],
+        conformance: {
+          total_traces: N,
+          fitting_traces: M,        # may be None if using trace_fitness
+          fitness_rate: float       # either M/N or avg(trace_fitness)
+        }
+      }
+    """
+    def get(self, request):
+        uri = get_database_uri()
+
+        # 1) Throughput: number of cases started per day
+        df_cases = pd.read_sql(
+            """
+            SELECT
+              c.case_id,
+              MIN(e.timestamp) AS start_ts
+            FROM events_event e
+            JOIN events_case c ON e.case_id = c.id
+            GROUP BY c.case_id
+            """,
+            uri,
+            parse_dates=["start_ts"]
+        )
+        df_cases["date"] = df_cases["start_ts"].dt.date
+        thr = (
+            df_cases["date"]
+            .value_counts()
+            .sort_index()
+            .rename_axis("date")
+            .reset_index(name="count")
+        )
+        throughput = thr.to_dict(orient="records")
+
+        # 2) Conformance: token-replay fitness against α-miner net
+        #    a) load full log with safe names
+        df = pd.read_sql(
+            """
+            SELECT
+              c.case_id    AS case_id,
+              e.activity   AS activity,
+              e.timestamp  AS timestamp,
+              e.resource   AS resource
+            FROM events_event e
+            JOIN events_case c ON e.case_id = c.id
+            """,
+            uri,
+            parse_dates=["timestamp"]
+        )
+        #    b) rename for PM4Py
+        df = df.rename(columns={
+            "case_id":   "case:concept:name",
+            "activity":  "concept:name",
+            "timestamp": "time:timestamp",
+            "resource":  "org:resource",
+        })
+        df = dataframe_utils.convert_timestamp_columns_in_df(df)
+        df = df.sort_values("time:timestamp")
+        log = convert.convert_to_event_log(df)
+
+        #    c) discover & replay
+        net, im, fm = alpha_miner.apply(log)
+        replayed = token_replay.apply(log, net, im, fm)
+
+        total_traces = len(replayed)
+        # handle both old and new replay keys
+        if replayed and "trace_is_fitting" in replayed[0]:
+            fitting_traces = sum(1 for r in replayed if r["trace_is_fitting"])
+            fitness_rate = fitting_traces / total_traces if total_traces else 0.0
+        elif replayed and "trace_fitness" in replayed[0]:
+            # trace_fitness is typically a float in [0,1]
+            fitness_rate = sum(r["trace_fitness"] for r in replayed) / total_traces
+            fitting_traces = None
+        else:
+            fitting_traces = None
+            fitness_rate = None
+
+        return Response({
+            "throughput": throughput,
+            "conformance": {
+                "total_traces":   total_traces,
+                "fitting_traces": fitting_traces,
+                "fitness_rate":   fitness_rate
+            }
+        })
+
+
+class ActivityFrequencyView(APIView):
+    """
+    GET /api/activity-frequency/
+    Returns JSON:
+      { activity_counts: [ { activity, date, count }, ... ] }
+    """
+    def get(self, request):
+        uri = get_database_uri()
+        df = pd.read_sql(
+            "SELECT activity, timestamp FROM events_event",
+            uri,
+            parse_dates=["timestamp"]
+        )
+        df["date"] = df["timestamp"].dt.date
+        freq = (
+            df
+            .groupby(["activity", "date"])
+            .size()
+            .reset_index(name="count")
+        )
+        records = freq.to_dict(orient="records")
+        return Response({"activity_counts": records})
