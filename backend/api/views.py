@@ -228,3 +228,37 @@ class ActivityFrequencyView(APIView):
         )
         records = freq.to_dict(orient="records")
         return Response({"activity_counts": records})
+
+
+import subprocess
+from rest_framework.permissions import IsAdminUser
+
+class RetrainModelView(APIView):
+    """
+    POST /api/retrain/
+    Triggers re-training of the XGBoost model (via your existing script)
+    and replaces the artifact in backend/models/.
+    Only accessible to admin users.
+    """
+    permission_classes = [IsAdminUser]
+
+    def post(self, request):
+        try:
+            # adjust path as needed
+            script_path = Path(__file__).resolve().parents[1] / "scripts" / "train_improved_model.py"
+            # run the training script
+            result = subprocess.run(
+                ["python", str(script_path)],
+                capture_output=True, text=True, check=False
+            )
+            if result.returncode != 0:
+                return Response(
+                    {"error": result.stderr},
+                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
+                )
+            return Response(
+                {"output": result.stdout},
+                status=status.HTTP_200_OK
+            )
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
