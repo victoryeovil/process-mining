@@ -1,208 +1,227 @@
-```markdown
-# Process-Mining Prototype
+Below is an updated **README.md** for the **process-mining-prototype** repo, with step-by-step instructions for both Docker-based and local (no-Docker) setups, environment variables, migrations, model training, and how to launch the Streamlit UI.
 
-A lightweight end-to-end demo of process-mining and ML-driven case-duration prediction, built with:
+````markdown
+# ⚙️ Process-Mining Prototype
 
-- **Django** + **PostgreSQL** (backend & REST API)  
-- **PM4Py** for process discovery & analysis  
-- **Streamlit** (frontend) driving off the REST API  
-- **scikit-learn** & **XGBoost** for ML  
-- **Optuna** for hyperparameter tuning  
+A demo end-to-end process-mining application, with:
 
----
-
-## 📁 Repository Structure
-
-```
-
-process-mining-prototype/
-├── .gitignore
-├── data/
-│   └── event\_logs/
-│       └── synthetic\_events.csv  ← generated log
-├── scripts/
-│   ├── generate\_synthetic\_logs.py
-│   ├── train\_model.py
-│   └── train\_improved\_model.py
-├── backend/
-│   ├── manage.py
-│   ├── requirements.txt
-│   ├── core/                     ← Django project
-│   │   ├── settings.py
-│   │   └── urls.py
-│   ├── events/                   ← events app
-│   │   ├── models.py
-│   │   └── management/commands/load\_events.py
-│   ├── api/                      ← REST API app
-│   │   ├── serializers.py
-│   │   ├── views.py
-│   │   └── urls.py
-│   └── models/                   ← serialized ML artifacts
-│       ├── case\_duration\_rf.joblib
-│       └── case\_duration\_xgb.joblib
-└── streamlit\_app/
-├── app.py
-├── requirements.txt
-└── Dockerfile (optional)
-
-````
+- **Django REST API** for metrics, process-map, conformance, throughput, predictions, and model retraining  
+- **PostgreSQL** (or SQLite) persistence  
+- **Streamlit** frontend for interactive dashboards and “upload & predict risk”  
 
 ---
 
-## 🛠 Prerequisites
+## 🚀 Quickstart with Docker Compose
 
-- **Python 3.10+**  
-- **PostgreSQL 15+**  
-- **pip** (or use `venv`/`poetry`)  
-- **Graphviz** (for PM4Py visualizations)  
-- **Node.js** only if you later add a JS frontend  
-
----
-
-## ⚙️ Backend Setup
-
-1. **Create & activate** a virtual environment:
+1. **Clone the repo**  
    ```bash
-   cd backend
-   python3 -m venv .env
-   source .env/bin/activate
+   git clone https://github.com/your-org/process-mining-prototype.git
+   cd process-mining-prototype
 ````
 
-2. **Install dependencies**:
+2. **Create your `.env` file**
+   Copy `​.env.example` to `.env` and edit as needed:
+
+   ```ini
+   # .env
+
+   # — PostgreSQL (only if using Postgres; see SQLite alternative below) —
+   POSTGRES_DB=pm_db
+   POSTGRES_USER=pm_user
+   POSTGRES_PASSWORD=pm_pass
+
+   # DATABASE_URL may point at Postgres or SQLite
+   # Use Postgres:      postgresql://pm_user:pm_pass@db:5432/pm_db
+   # Or SQLite fallback:
+   DATABASE_URL=sqlite:///app/db.sqlite3
+
+   # Backend (Django) settings
+   SECRET_KEY=replace-me-with-a-secure-one
+   DEBUG=True
+
+   # API URL for Streamlit frontend
+   API_URL=http://backend:8000
+   ```
+
+3. **Build & run all services**
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+4. **Check that containers are running**
+
+   ```bash
+   docker compose ps
+   ```
+
+5. **(First run) Create a Django superuser**
+
+   ```bash
+   docker compose exec backend python manage.py createsuperuser
+   ```
+
+6. **(If using Postgres) Load initial event data**
+
+   ```bash
+   # from project root
+   docker compose exec backend python manage.py loaddata synthetic_events
+   ```
+
+   Or use your own management command:
+
+   ```bash
+   docker compose exec backend python manage.py load_events
+   ```
+
+7. **Train or retrain ML models**
+
+   * **Reopen-risk**
+
+     ```bash
+     docker compose exec backend python scripts/train_reopen_classifier.py ./backend/data/event_logs/synthetic_events.csv
+     ```
+   * **Case-duration**
+
+     ```bash
+     docker compose exec backend python scripts/train_improved_model.py
+     ```
+
+   Or via the REST API (admin only):
+
+   ```bash
+   curl -X POST -H "Authorization: Bearer <your_admin_token>" \
+     http://localhost:8000/api/retrain/
+   ```
+
+8. **Visit the apps**
+
+   * **Django API** → [http://localhost:8000/api/metrics/](http://localhost:8000/api/metrics/)  (you’ll need to log in for protected endpoints)
+   * **Streamlit UI** → [http://localhost:8501](http://localhost:8501)
+
+---
+
+## 🛠️ Local (no-Docker) Development
+
+> **Prerequisites:** Python 3.10+, `pip`, PostgreSQL (or skip for SQLite),
+
+1. **Clone & enter**
+
+   ```bash
+   git clone https://github.com/your-org/process-mining-prototype.git
+   cd process-mining-prototype
+   ```
+
+2. **Create & activate a virtualenv**
+
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate
+   ```
+
+3. **Install backend deps**
 
    ```bash
    pip install --upgrade pip
-   pip install -r requirements.txt
+   pip install -r backend/requirements.txt
    ```
 
-3. **Configure database** (in `backend/core/settings.py`):
-
-   ```python
-   DATABASES = {
-     'default': {
-       'ENGINE':   'django.db.backends.postgresql',
-       'NAME':     'pm_db',
-       'USER':     'pm_user',
-       'PASSWORD': 'pm_pass',
-       'HOST':     'localhost',
-       'PORT':     '5432',
-     }
-   }
-   ```
-
-4. **Apply migrations**:
+4. **Install Streamlit deps**
 
    ```bash
+   pip install -r streamlit_app/requirements.txt
+   ```
+
+5. **Configure your `.env`** (see above).
+
+6. **Run Django migrations**
+
+   ```bash
+   cd backend
    python manage.py migrate
+   python manage.py createsuperuser
    ```
 
-5. **Load or generate event logs**:
-
-   * **Generate** synthetic data:
-
-     ```bash
-     chmod +x ../scripts/generate_synthetic_logs.py
-     ../scripts/generate_synthetic_logs.py
-     ```
-   * **Load** into Postgres:
-
-     ```bash
-     python manage.py load_events ../data/event_logs/synthetic_events.csv
-     ```
-
-6. **Train ML models**:
-
-   * **RandomForest**:
-
-     ```bash
-     chmod +x ../scripts/train_model.py
-     ../scripts/train_model.py
-     ```
-   * **XGBoost + Optuna**:
-
-     ```bash
-     pip install optuna xgboost
-     chmod +x ../scripts/train_improved_model.py
-     ../scripts/train_improved_model.py
-     ```
-
-7. **Run the server**:
+7. **Load or generate event data**
 
    ```bash
-   python manage.py runserver 8000
+   python manage.py load_events
    ```
+
+8. **Train models**
+
+   ```bash
+   python scripts/train_reopen_classifier.py ../backend/data/event_logs/synthetic_events.csv
+   python scripts/train_improved_model.py
+   ```
+
+9. **Start the Django server**
+
+   ```bash
+   python manage.py runserver
+   ```
+
+10. **Run Streamlit** (in repo root)
+
+    ```bash
+    cd ../streamlit_app
+    streamlit run app.py
+    ```
 
 ---
 
-## 🚀 REST API
+## 📂 Project Layout
 
-| Endpoint                               | Description                                      |
-| -------------------------------------- | ------------------------------------------------ |
-| `GET /api/metrics/`                    | Returns cycle-time metrics & bottleneck list     |
-| `GET /api/process-map/`                | Returns an α-miner Petri net as PNG              |
-| `GET /api/predict-duration/<case_id>/` | Predicts case duration (hours) via trained model |
-
-Test with:
-
-```bash
-curl http://localhost:8000/api/metrics/
-curl http://localhost:8000/api/process-map/ --output net.png
-curl http://localhost:8000/api/predict-duration/CASE_0001/
+```
+├── backend
+│   ├── api/               ← Django REST views & serializers
+│   ├── core/              ← Django project settings, URLs, wsgi, utils
+│   ├── data/              ← example CSV event-logs
+│   ├── events/            ← `Event` & `Case` models, management cmds
+│   ├── models/            ← persisted ML artifacts (.joblib)
+│   ├── scripts/           ← training pipelines for ML models
+│   ├── entrypoint.sh      ← Docker entrypoint (migrations + gunicorn)
+│   ├── Dockerfile
+│   ├── manage.py
+│   └── requirements.txt
+├── streamlit_app
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+├── docker-compose.yml
+├── .env.example
+└── README.md  ← you are here
 ```
 
 ---
 
-## 📊 Streamlit Dashboard
+## ⚙️ Tips & Troubleshooting
 
-1. **Switch to the Streamlit env** (you can reuse the backend venv or create a new one):
+* **Switching DB**: set `DATABASE_URL` to `sqlite:///app/db.sqlite3` for SQLite, or to a full `postgresql://…` URI for Postgres.
+* **Inspecting volumes**:
 
-   ```bash
-   cd streamlit_app
-   python3 -m venv .env
-   source .env/bin/activate
-   pip install -r requirements.txt requests
-   ```
+  ```bash
+  docker run --rm -v process-mining-prototype_db_data:/data busybox ls -R /data
+  ```
+* **Free up space**:
 
-2. **Configure** the API base URL in `.env` (at project root or in `streamlit_app/`):
+  ```bash
+  docker system prune -af
+  docker volume prune -f
+  ```
+* **Logs**:
 
-   ```dotenv
-   API_URL=http://localhost:8000
-   ```
+  ```bash
+  docker compose logs -f backend
+  docker compose logs -f streamlit
+  ```
+* **Rebuild only one service**:
 
-3. **Run** the dashboard:
-
-   ```bash
-   streamlit run app.py --server.address=0.0.0.0 --server.port=8501
-   ```
-
-4. **Features**:
-
-   * **Top-line metrics** & **bottleneck chart** via `/api/metrics/`
-   * **Process-map viewer** via `/api/process-map/`
-   * **Case-duration predictor** via `/api/predict-duration/…/`
+  ```bash
+  docker compose build backend
+  docker compose up -d backend
+  ```
 
 ---
 
-## ✅ What’s Done
-
-* Data ingestion & storage (Django models + management command)
-* Synthetic-log generator & loader (\~25 k events)
-* PM4Py utility & shell verification (500 traces)
-* REST API for metrics, process-map, predictions
-* Streamlit dashboard driving off the API
-* Enhanced analytics: multi-miner selection, bottlenecks, throughput charts
-* ML pipelines: RandomForest & XGBoost with Optuna tuning
-
----
-
-## 🔜 Next Steps
-
-* **Dockerization** of backend + frontend + Postgres
-* **Authentication** (DRF or JWT) for the API & dashboard
-* **Conformance checking** & additional performance metrics
-* **Automated retraining** endpoint & CI/CD pipeline
-* **Unit/integration tests** and GitHub Actions setup
-
----
-
-Feel free to open issues or PRs—happy process-mining!
+Happy process-mining! 🎉

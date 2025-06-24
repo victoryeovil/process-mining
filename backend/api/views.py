@@ -161,22 +161,63 @@ class ActivityFrequencyView(APIView):
         return Response({"activity_counts": freq.to_dict(orient="records")})
 
 
+# Path to your CSV (adjust if yours lives elsewhere)
+CSV_PATH = Path(settings.BASE_DIR) / "data" / "event_logs" / "synthetic_events.csv"
+
+def load_event_df():
+    """
+    Read the single canonical CSV and return a DataFrame
+    with the same columns your SQL used to provide.
+    """
+    df = pd.read_csv(CSV_PATH, parse_dates=["timestamp"])
+    # If your CSV has different column names, rename here:
+    # df = df.rename(columns={"csv_case_id": "case_id", ...})
+    return df
+
+# adjust this to wherever your CSV actually lives
+CANONICAL_CSV = Path(__file__).resolve().parents[1] / "data" / "event_logs" / "synthetic_events.csv"
+
 class RetrainModelView(APIView):
-    """6) Retrain XGBoost (admin only)."""
+    """
+    POST /api/retrain/
+    Re-trains reopen-risk model from a single CSV (admin only).
+    """
     permission_classes = [IsAdminUser]
 
     def post(self, request):
-        script = Path(__file__).resolve().parents[1] / "scripts" / "train_improved_model.py"
-        try:
-            result = subprocess.run(
-                ["python", str(script)],
-                capture_output=True, text=True
+        # 1) check script exists
+        script = Path(__file__).resolve().parents[1] / "scripts" / "train_reopen_classifier.py"
+        if not script.exists():
+            return Response(
+                {"error": f"Training script not found at {script}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-            if result.returncode != 0:
-                return Response(
-                    {"error": result.stderr},
-                    status=status.HTTP_500_INTERNAL_SERVER_ERROR
-                )
-            return Response({"output": result.stdout})
+
+        # 2) ensure CSV is present
+        if not CANONICAL_CSV.exists():
+            return Response(
+                {"error": f"Event log CSV not found at {CANONICAL_CSV}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # 3) call the script
+        cmd = ["python", str(script), str(CANONICAL_CSV)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True)
         except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response(
+                {"error": f"Failed to launch training script: {e}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        # 4) handle result
+        if proc.returncode != 0:
+            return Response(
+                {"error": proc.stderr.strip() or "Unknown error during training"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+        return Response(
+            {"output": proc.stdout.strip() or "Retraining succeeded"},
+            status=status.HTTP_200_OK
+        )
