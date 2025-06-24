@@ -1,4 +1,5 @@
 import io
+import subprocess
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,8 @@ from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.permissions import IsAdminUser
+from graphviz.backend.execute import ExecutableNotFound
 
 from events.models import Event
 from pm4py import convert
@@ -17,248 +20,163 @@ from pm4py.visualization.petri_net import visualizer as pn_visualizer
 from pm4py.algo.conformance.tokenreplay import algorithm as token_replay
 
 
-def get_database_uri():
-    db = settings.DATABASES["default"]
-    return (
-        f"postgresql://{db['USER']}:{db['PASSWORD']}"
-        f"@{db['HOST']}:{db['PORT']}/{db['NAME']}"
-    )
-
-
 class MetricsView(APIView):
-    """Return cycle-time metrics and bottleneck data."""
+    """1) Cycle-time metrics & bottleneck."""
     def get(self, request):
-        uri = get_database_uri()
-        query = """
-          SELECT c.case_id AS case_id, e.activity, e.timestamp, e.resource
-          FROM events_event e
-          JOIN events_case c ON e.case_id = c.id
-        """
-        df = pd.read_sql(query, uri, parse_dates=["timestamp"])
-        # Cycle-time
+        qs = Event.objects.select_related("case").values(
+            "case__case_id", "activity", "timestamp", "resource"
+        )
+        df = pd.DataFrame.from_records(qs).rename(
+            columns={"case__case_id": "case_id"}
+        )
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # Cycle-time per case
         ct = df.groupby("case_id")["timestamp"].agg(start="min", end="max")
-        ct["duration"] = (ct["end"] - ct["start"]).dt.total_seconds() / 3600
+        ct["duration"] = (ct.end - ct.start).dt.total_seconds() / 3600
         metrics = {
-            "total_cases": int(ct.shape[0]),
-            "total_events": int(df.shape[0]),
-            "avg_cycle_time_hours": float(ct["duration"].mean()),
-            "max_cycle_time_hours": float(ct["duration"].max()),
+            "total_cases":   int(ct.shape[0]),
+            "total_events":  int(df.shape[0]),
+            "avg_cycle_time_hours": float(ct.duration.mean()),
+            "max_cycle_time_hours": float(ct.duration.max()),
         }
+
         # Bottleneck
         df = df.sort_values(["case_id", "timestamp"])
         df["next_ts"] = df.groupby("case_id")["timestamp"].shift(-1)
-        df["act_dur"] = (
-            df["next_ts"] - df["timestamp"]
-        ).dt.total_seconds() / 3600
-        bn = df.dropna(subset=["act_dur"]).groupby("activity")["act_dur"].mean()
-        bottleneck = [
-            {"activity": act, "avg_hours": float(dur)} for act, dur in bn.items()
-        ]
+        df["act_dur"] = (df.next_ts - df.timestamp).dt.total_seconds() / 3600
+        bn = df.dropna(subset=["act_dur"]).groupby("activity").act_dur.mean()
+        bottleneck = [{"activity": a, "avg_hours": float(d)} for a, d in bn.items()]
+
         return Response({"metrics": metrics, "bottleneck": bottleneck})
 
 
 class ProcessMapView(APIView):
-    """Return α-miner Petri net as a PNG image."""
+    """2) α-miner Petri net PNG."""
     def get(self, request):
-        uri = get_database_uri()
-        query = """
-          SELECT c.case_id AS case_id, 
-                 e.activity    AS activity,
-                 e.timestamp   AS timestamp,
-                 e.resource    AS resource
-          FROM events_event e
-          JOIN events_case c ON e.case_id = c.id
-        """
-        df = pd.read_sql(query, uri, parse_dates=["timestamp"])
-        # rename for PM4Py
-        df = df.rename(columns={
-            "case_id":       "case:concept:name",
+        qs = Event.objects.select_related("case").values(
+            "case__case_id", "activity", "timestamp", "resource"
+        )
+        df = pd.DataFrame.from_records(qs).rename(columns={
+            "case__case_id": "case:concept:name",
             "activity":      "concept:name",
             "timestamp":     "time:timestamp",
             "resource":      "org:resource",
         })
-        df = dataframe_utils.convert_timestamp_columns_in_df(df)
-        df = df.sort_values("time:timestamp")
+        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+        df = dataframe_utils.convert_timestamp_columns_in_df(df).sort_values("time:timestamp")
+
         log = convert.convert_to_event_log(df)
-        net, im, fm = alpha_miner.apply(log)
-        gviz = pn_visualizer.apply(net, im, fm)
-        img_bytes = gviz.pipe(format="png")
-        return HttpResponse(img_bytes, content_type="image/png")
+        try:
+            net, im, fm = alpha_miner.apply(log)
+            gviz       = pn_visualizer.apply(net, im, fm)
+            img_bytes  = gviz.pipe(format="png")
+            return HttpResponse(img_bytes, content_type="image/png")
+        except ExecutableNotFound:
+            return Response(
+                {"error": "Graphviz ‘dot’ executable not found."},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+        finally:
+            try: gviz.cleanup()
+            except: pass
 
 
 class PredictDurationView(APIView):
-    """Predict case duration given a case_id."""
+    """3) Predict case duration."""
     def get(self, request, case_id):
-        # Load model
-        base = Path(__file__).resolve().parents[1]
-        model = joblib.load(base / "models" / "case_duration_rf.joblib")
-        # Fetch events
+        model_fp = Path(__file__).resolve().parents[1] / "models" / "case_duration_rf.joblib"
+        model    = joblib.load(model_fp)
+
         qs = Event.objects.filter(case__case_id=case_id)
         if not qs.exists():
-            return Response(
-                {"error": "Case not found"}, status=status.HTTP_404_NOT_FOUND
-            )
-        df = pd.DataFrame.from_records(qs.values(
-            "activity", "timestamp", "resource"
-        ))
+            return Response({"error": "Case not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        df = pd.DataFrame.from_records(qs.values("activity","timestamp","resource"))
         df["timestamp"] = pd.to_datetime(df["timestamp"])
-        feats = [
-            df.shape[0],
-            df["activity"].nunique(),
-            df["resource"].nunique(),
-        ]
-        pred = model.predict([feats])[0]
-        return Response({
-            "case_id": case_id,
-            "predicted_duration_hours": float(pred),
-        })
+        feats = [len(df), df.activity.nunique(), df.resource.nunique()]
+        pred  = model.predict([feats])[0]
+        return Response({"case_id": case_id, "predicted_duration_hours": float(pred)})
 
 
 class PerformanceView(APIView):
-    """
-    GET /api/performance/
-    Returns:
-      {
-        throughput: [{date: "YYYY-MM-DD", count: N}, ...],
-        conformance: {
-          total_traces: N,
-          fitting_traces: M,        # may be None if using trace_fitness
-          fitness_rate: float       # either M/N or avg(trace_fitness)
-        }
-      }
-    """
+    """4) Throughput & conformance (token-replay)."""
     def get(self, request):
-        uri = get_database_uri()
-
-        # 1) Throughput: number of cases started per day
-        df_cases = pd.read_sql(
-            """
-            SELECT
-              c.case_id,
-              MIN(e.timestamp) AS start_ts
-            FROM events_event e
-            JOIN events_case c ON e.case_id = c.id
-            GROUP BY c.case_id
-            """,
-            uri,
-            parse_dates=["start_ts"]
-        )
-        df_cases["date"] = df_cases["start_ts"].dt.date
-        thr = (
-            df_cases["date"]
-            .value_counts()
-            .sort_index()
-            .rename_axis("date")
-            .reset_index(name="count")
-        )
+        # Throughput
+        qs = Event.objects.select_related("case").order_by("timestamp")
+        dfc = (pd.DataFrame.from_records(qs.values("case__case_id","timestamp"))
+                 .rename(columns={"case__case_id":"case_id"}))
+        dfc["timestamp"] = pd.to_datetime(dfc.timestamp)
+        starts = dfc.groupby("case_id").timestamp.min().reset_index(name="start_ts")
+        starts["date"] = starts.start_ts.dt.date
+        thr = starts.date.value_counts().sort_index().reset_index(name="count")
+        thr.columns = ["date","count"]
         throughput = thr.to_dict(orient="records")
 
-        # 2) Conformance: token-replay fitness against α-miner net
-        #    a) load full log with safe names
-        df = pd.read_sql(
-            """
-            SELECT
-              c.case_id    AS case_id,
-              e.activity   AS activity,
-              e.timestamp  AS timestamp,
-              e.resource   AS resource
-            FROM events_event e
-            JOIN events_case c ON e.case_id = c.id
-            """,
-            uri,
-            parse_dates=["timestamp"]
+        # Conformance
+        qs2 = Event.objects.select_related("case").values(
+            "case__case_id","activity","timestamp","resource"
         )
-        #    b) rename for PM4Py
-        df = df.rename(columns={
-            "case_id":   "case:concept:name",
-            "activity":  "concept:name",
-            "timestamp": "time:timestamp",
-            "resource":  "org:resource",
-        })
-        df = dataframe_utils.convert_timestamp_columns_in_df(df)
-        df = df.sort_values("time:timestamp")
+        df = (pd.DataFrame.from_records(qs2)
+              .rename(columns={
+                  "case__case_id":"case:concept:name",
+                  "activity":"concept:name",
+                  "timestamp":"time:timestamp",
+                  "resource":"org:resource"
+              }))
+        df["time:timestamp"] = pd.to_datetime(df["time:timestamp"])
+        df = dataframe_utils.convert_timestamp_columns_in_df(df).sort_values("time:timestamp")
         log = convert.convert_to_event_log(df)
 
-        #    c) discover & replay
         net, im, fm = alpha_miner.apply(log)
-        replayed = token_replay.apply(log, net, im, fm)
-
+        replayed    = token_replay.apply(log, net, im, fm)
         total_traces = len(replayed)
-        # handle both old and new replay keys
+
         if replayed and "trace_is_fitting" in replayed[0]:
-            fitting_traces = sum(1 for r in replayed if r["trace_is_fitting"])
-            fitness_rate = fitting_traces / total_traces if total_traces else 0.0
+            fit_tr = sum(1 for r in replayed if r["trace_is_fitting"])
+            fit_rt = fit_tr / total_traces if total_traces else 0.0
         elif replayed and "trace_fitness" in replayed[0]:
-            # trace_fitness is typically a float in [0,1]
-            fitness_rate = sum(r["trace_fitness"] for r in replayed) / total_traces
-            fitting_traces = None
+            fit_tr, fit_rt = None, sum(r["trace_fitness"] for r in replayed)/total_traces
         else:
-            fitting_traces = None
-            fitness_rate = None
+            fit_tr, fit_rt = None, None
 
         return Response({
             "throughput": throughput,
             "conformance": {
                 "total_traces":   total_traces,
-                "fitting_traces": fitting_traces,
-                "fitness_rate":   fitness_rate
+                "fitting_traces": fit_tr,
+                "fitness_rate":   fit_rt
             }
         })
 
 
 class ActivityFrequencyView(APIView):
-    """
-    GET /api/activity-frequency/
-    Returns JSON:
-      { activity_counts: [ { activity, date, count }, ... ] }
-    """
+    """5) Counts per activity per day."""
     def get(self, request):
-        uri = get_database_uri()
-        df = pd.read_sql(
-            "SELECT activity, timestamp FROM events_event",
-            uri,
-            parse_dates=["timestamp"]
-        )
-        df["date"] = df["timestamp"].dt.date
-        freq = (
-            df
-            .groupby(["activity", "date"])
-            .size()
-            .reset_index(name="count")
-        )
-        records = freq.to_dict(orient="records")
-        return Response({"activity_counts": records})
+        qs = Event.objects.values("activity","timestamp")
+        df = pd.DataFrame.from_records(qs)
+        df["timestamp"] = pd.to_datetime(df.timestamp)
+        df["date"] = df.timestamp.dt.date
+        freq = df.groupby(["activity","date"]).size().reset_index(name="count")
+        return Response({"activity_counts": freq.to_dict(orient="records")})
 
-
-import subprocess
-from rest_framework.permissions import IsAdminUser
 
 class RetrainModelView(APIView):
-    """
-    POST /api/retrain/
-    Triggers re-training of the XGBoost model (via your existing script)
-    and replaces the artifact in backend/models/.
-    Only accessible to admin users.
-    """
+    """6) Retrain XGBoost (admin only)."""
     permission_classes = [IsAdminUser]
 
     def post(self, request):
+        script = Path(__file__).resolve().parents[1] / "scripts" / "train_improved_model.py"
         try:
-            # adjust path as needed
-            script_path = Path(__file__).resolve().parents[1] / "scripts" / "train_improved_model.py"
-            # run the training script
             result = subprocess.run(
-                ["python", str(script_path)],
-                capture_output=True, text=True, check=False
+                ["python", str(script)],
+                capture_output=True, text=True
             )
             if result.returncode != 0:
                 return Response(
                     {"error": result.stderr},
                     status=status.HTTP_500_INTERNAL_SERVER_ERROR
                 )
-            return Response(
-                {"output": result.stdout},
-                status=status.HTTP_200_OK
-            )
+            return Response({"output": result.stdout})
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

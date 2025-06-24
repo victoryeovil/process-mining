@@ -1,0 +1,6 @@
+# ignore everything except requirements.txt for the pip layer
+**
+!requirements.txt
+
+# then bring back your code for the COPY in step 3
+!**
