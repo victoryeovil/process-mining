@@ -1,6 +1,4 @@
-Below is an updated **README.md** for the **process-mining-prototype** repo, with step-by-step instructions for both Docker-based and local (no-Docker) setups, environment variables, migrations, model training, and how to launch the Streamlit UI.
 
-````markdown
 # ⚙️ Process-Mining Prototype
 
 A demo end-to-end process-mining application, with:
@@ -9,7 +7,7 @@ A demo end-to-end process-mining application, with:
 - **PostgreSQL** (or SQLite) persistence  
 - **Streamlit** frontend for interactive dashboards and “upload & predict risk”  
 
----
+
 
 ## 🚀 Quickstart with Docker Compose
 
@@ -17,7 +15,7 @@ A demo end-to-end process-mining application, with:
    ```bash
    git clone https://github.com/your-org/process-mining-prototype.git
    cd process-mining-prototype
-````
+```
 
 2. **Create your `.env` file**
    Copy `​.env.example` to `.env` and edit as needed:
